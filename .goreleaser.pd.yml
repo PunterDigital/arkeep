@@ -1,0 +1,216 @@
+version: 2
+
+# GoReleaser config for PunterDigital's patched builds (tags vX.Y.Z-pd.N, see
+# PATCHES.md). Upstream's .goreleaser.yml is left untouched so upstream merges
+# stay clean; when it changes, port the change here. Differences from it:
+# images go to ghcr.io/punterdigital only (no Docker Hub), releases are
+# published on PunterDigital/arkeep, and a -pd.N tag is a full release (it
+# moves `latest`), not a pre-release.
+
+project_name: arkeep
+
+before:
+  hooks:
+    - sh -c "cd gui && pnpm install --frozen-lockfile && pnpm build"
+    - sh -c "mkdir -p server/cmd/server/dist && cp -r gui/dist/. server/cmd/server/dist"
+    - sh -c "cd agent && go run ./scripts/download_deps.go --all-platforms"
+
+builds:
+  - id: server
+    binary: arkeep-server
+    main: ./cmd/server
+    dir: server
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+  - id: agent
+    binary: arkeep-agent
+    main: ./cmd/agent
+    dir: agent
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+  - id: agent-embedded
+    binary: arkeep-agent
+    main: ./cmd/agent
+    dir: agent
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    goos:
+      - linux
+    goarch:
+      - arm
+      - mips
+      - mipsle
+    goarm:
+      - "7"
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: server
+    ids: [server]
+    name_template: "arkeep-server_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - PATCHES.md
+      - deploy/systemd/arkeep-server.service
+
+  - id: agent
+    ids: [agent, agent-embedded]
+    name_template: "arkeep-agent_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - PATCHES.md
+      - deploy/systemd/arkeep-agent.service
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+dockers_v2:
+  - id: server
+    ids: [server]
+    dockerfile: server/Dockerfile.goreleaser
+    images:
+      - "ghcr.io/punterdigital/arkeep-server"
+    tags:
+      - "{{ .Tag }}"
+      - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.title": "arkeep-server"
+      "org.opencontainers.image.description": "Arkeep server (PunterDigital patched build): web UI, REST API and gRPC hub for self-hosted Restic and Rclone backups"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .Commit }}"
+      "org.opencontainers.image.created": "{{ .Date }}"
+      "org.opencontainers.image.source": "https://github.com/PunterDigital/arkeep"
+      "org.opencontainers.image.documentation": "https://arkeep.io/docs/"
+      "org.opencontainers.image.licenses": "Apache-2.0"
+    annotations:
+      "index:org.opencontainers.image.description": "Arkeep server (PunterDigital patched build): web UI, REST API and gRPC hub for self-hosted Restic and Rclone backups"
+
+  - id: agent
+    ids: [agent]
+    dockerfile: agent/Dockerfile.goreleaser
+    extra_files:
+      - agent/entrypoint.sh
+    images:
+      - "ghcr.io/punterdigital/arkeep-agent"
+    tags:
+      - "{{ .Tag }}"
+      - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.title": "arkeep-agent"
+      "org.opencontainers.image.description": "Arkeep agent (PunterDigital patched build): backs up a machine with embedded Restic and Rclone, driven by an Arkeep server"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .Commit }}"
+      "org.opencontainers.image.created": "{{ .Date }}"
+      "org.opencontainers.image.source": "https://github.com/PunterDigital/arkeep"
+      "org.opencontainers.image.documentation": "https://arkeep.io/docs/"
+      "org.opencontainers.image.licenses": "Apache-2.0"
+    annotations:
+      "index:org.opencontainers.image.description": "Arkeep agent (PunterDigital patched build): backs up a machine with embedded Restic and Rclone, driven by an Arkeep server"
+
+# The release workflow sets GORELEASER_PREVIOUS_TAG: the upstream base tag for
+# -pd.1, the previous -pd tag after that. So the notes of a -pd.1 release list
+# every PunterDigital change on top of upstream.
+changelog:
+  use: github
+  sort: asc
+  abbrev: 7
+  format: "{{ .Message }} ({{ .SHA }}){{ with .AuthorUsername }} by @{{ . }}{{ end }}"
+  groups:
+    - title: "Features"
+      regexp: '^feat(\(.+\))?!?:'
+      order: 1
+    - title: "Fixes"
+      regexp: '^fix(\(.+\))?!?:'
+      order: 2
+    - title: "Build & CI"
+      regexp: '^(build|ci)(\(.+\))?!?:'
+      order: 3
+    - title: "Other changes"
+      order: 999
+  filters:
+    exclude:
+      - '^test(\(.+\))?:'
+      - '^style(\(.+\))?:'
+      - '^docs(\(.+\))?:'
+      - '^chore\(release\):'
+
+release:
+  github:
+    owner: PunterDigital
+    name: arkeep
+  prerelease: "false"
+  make_latest: "true"
+  header: |
+    Patched build of upstream [Arkeep {{ envOrDefault "UPSTREAM_BASE" "" }}](https://github.com/arkeep-io/arkeep/releases/tag/{{ envOrDefault "UPSTREAM_BASE" "" }}) by PunterDigital. What differs from upstream is listed in [PATCHES.md](https://github.com/PunterDigital/arkeep/blob/{{ .Tag }}/PATCHES.md).
+
+    > [!IMPORTANT]
+    > Database migrations run automatically when the server starts. Back up your database (or the `data/` volume) before upgrading — see [Upgrading](https://arkeep.io/docs/installation/upgrading/).
+
+    ## Install
+
+    ```bash
+    docker pull ghcr.io/punterdigital/arkeep-server:{{ .Tag }}
+    docker pull ghcr.io/punterdigital/arkeep-agent:{{ .Tag }}
+    ```
+
+    Images are built for `linux/amd64` and `linux/arm64`. Standalone binaries (server for Linux and macOS; agent for Linux amd64/arm64/armv7/mips/mipsle, macOS and Windows) are attached below. Setup follows the upstream [installation docs](https://arkeep.io/docs/installation/docker-compose/): swap `arkeepio/…` / `ghcr.io/arkeep-io/…` image names for the ones above.
+
+  footer: |
+    ## Verify
+
+    ```bash
+    sha256sum --check --ignore-missing checksums.txt
+    gh attestation verify arkeep-server_linux_amd64.tar.gz --repo PunterDigital/arkeep
+    gh attestation verify oci://ghcr.io/punterdigital/arkeep-server:{{ .Tag }} --repo PunterDigital/arkeep
+    ```
+    {{ if .PreviousTag }}
+    **Full Changelog**: https://github.com/PunterDigital/arkeep/compare/{{ .PreviousTag }}...{{ .Tag }}
+    {{- end }}

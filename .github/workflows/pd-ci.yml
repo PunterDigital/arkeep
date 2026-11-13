@@ -1,0 +1,74 @@
+name: CI (PunterDigital)
+
+# Checks for what the PunterDigital fork adds on top of upstream's ci.yml and
+# security.yml (which run unchanged): a Playwright smoke test of the built
+# server with its embedded GUI, and the fork's GoReleaser config.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  e2e:
+    name: E2E (Playwright)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+          cache-dependency-path: server/go.sum
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: gui/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: "pnpm"
+          cache-dependency-path: gui/pnpm-lock.yaml
+
+      - name: Build the GUI and the server
+        run: |
+          cd gui && pnpm install --frozen-lockfile && pnpm build && cd ..
+          cp -r gui/dist/. server/cmd/server/dist
+          cd server && CGO_ENABLED=0 GOWORK=off go build -o ../bin/arkeep-server ./cmd/server
+
+      - name: Install Playwright
+        run: cd e2e && npm ci && npx playwright install --with-deps chromium
+
+      - name: Run the smoke test
+        run: cd e2e && npx playwright test
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 14
+
+  release-config:
+    name: Release config (fork)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: check --config .goreleaser.pd.yml
