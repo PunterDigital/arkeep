@@ -55,12 +55,24 @@ gh pr create … ; wait for CI; gh pr merge --merge
 
 Then release `vX.Y.Z-pd.1`. A patch that upstream has merged comes out of `PATCHES.md`.
 
-## Contributing upstream
+## Contributing upstream: the `upstream` tag
 
-Branch from the upstream tag/branch (`git switch -c fix/… upstream/develop`; upstream merges
-features into `develop`, releases from `main`), push to our fork and open the PR against
-`arkeep-io/arkeep:develop`. Follow `CONTRIBUTING.md` (Conventional Commits). Ask Shay before
-opening one: it's public, under his name.
+Shay decides per card (Nov 13). A GroundStation card tagged **`upstream`** goes upstream; that
+tag is his OK to open the public PR under his name. A card without it is a fork-only patch:
+don't offer it upstream unasked (suggesting the tag in a triage comment is fine).
+
+For an `upstream` card:
+
+1. Branch from upstream's `develop` (they merge features there and release from `main`):
+   `git fetch upstream && git switch -c fix/<slug> upstream/develop`. Follow `CONTRIBUTING.md`
+   (Conventional Commits, their PR template, their tests). Nothing fork-specific in it: no
+   `PATCHES.md`, `e2e/` or `pd-*` files.
+2. Push the branch to our fork and open the PR against `arkeep-io/arkeep:develop`.
+3. Carry it in our build: cherry-pick onto a `claude/<card>-<slug>` branch from our `main`, add a
+   `PATCHES.md` row with the upstream PR link, our PR, squash-merge, then release `-pd.N+1`.
+4. When an upstream release includes it, the sync PR drops the `PATCHES.md` row (resolve any
+   conflict in upstream's favour). If upstream closes the PR, it stays a fork patch: say so on
+   the card.
 
 ## Commands
 
