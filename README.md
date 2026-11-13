@@ -1,5 +1,11 @@
 # Arkeep
 
+> [!NOTE]
+> **PunterDigital fork.** This repository builds a patched Arkeep: releases are tagged `vX.Y.Z-pd.N`
+> on top of upstream `vX.Y.Z`, with images at `ghcr.io/punterdigital/arkeep-server` and `-agent`.
+> What differs from upstream is in [PATCHES.md](PATCHES.md). For the official project, go to
+> [arkeep-io/arkeep](https://github.com/arkeep-io/arkeep). [Downloads](https://punterdigital.github.io/personal-apps/#arkeep).
+
 > Your infra's Ark — back up everything, keep it yours.
 
 [![Latest release](https://img.shields.io/github/v/release/arkeep-io/arkeep?sort=semver)](https://github.com/arkeep-io/arkeep/releases/latest)

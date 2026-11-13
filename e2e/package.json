@@ -1,0 +1,12 @@
+{
+  "name": "arkeep-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Playwright smoke tests against a built arkeep-server (PunterDigital fork, see CLAUDE.md)",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0"
+  }
+}

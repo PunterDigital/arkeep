@@ -1,0 +1,153 @@
+name: Release (PunterDigital)
+
+# Releases PunterDigital's patched builds from vX.Y.Z-pd.N tags (see
+# PATCHES.md and CLAUDE.md). Upstream's release.yml is disabled on this fork
+# (gh workflow disable) and kept unchanged so upstream merges stay clean.
+
+on:
+  push:
+    tags:
+      - "v*-pd.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # vX.Y.Z-pd.N on the history of main. X.Y.Z is the upstream release the
+      # build is based on, and that tag must exist here (pushed from upstream).
+      # The previous tag for the changelog is the upstream base for -pd.1 and
+      # the previous -pd tag after that.
+      - name: Validate tag and pick the previous tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pd\.([1-9][0-9]*)$ ]]; then
+            echo "::error::Tag '${tag}' is not a PunterDigital release tag (vX.Y.Z-pd.N)."
+            exit 1
+          fi
+          base="${tag%-pd.*}"
+          n="${BASH_REMATCH[4]}"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
+            echo "::error::Tag '${tag}' (${commit}) is not on main."
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/${base}^{commit}" >/dev/null; then
+            echo "::error::Upstream base tag '${base}' is missing: push it from the upstream remote first."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "refs/tags/${base}^{commit}" "$commit"; then
+            echo "::error::'${tag}' does not contain upstream '${base}': merge it into main first."
+            exit 1
+          fi
+          if [ "$n" = "1" ]; then prev="$base"; else prev="${base}-pd.$((n - 1))"; fi
+          git rev-parse --verify --quiet "refs/tags/${prev}^{commit}" >/dev/null || prev="$base"
+          echo "Releasing ${tag} on upstream ${base}; changelog since ${prev}."
+          echo "UPSTREAM_BASE=${base}" >> "$GITHUB_ENV"
+          echo "GORELEASER_PREVIOUS_TAG=${prev}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.work
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: gui/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: "pnpm"
+          cache-dependency-path: gui/pnpm-lock.yaml
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --clean --config .goreleaser.pd.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect the artifacts to attest
+        shell: bash
+        run: |
+          set -euo pipefail
+          subjects="${RUNNER_TEMP}/subjects.txt"
+          cp dist/checksums.txt "$subjects"
+          (cd dist && sha256sum checksums.txt) >> "$subjects"
+          for image in arkeep-server arkeep-agent; do
+            digest=$(docker buildx imagetools inspect "ghcr.io/punterdigital/${image}:${GITHUB_REF_NAME}" --format '{{.Manifest.Digest}}')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::No digest found for ${image}."
+              exit 1
+            fi
+            echo "${digest#sha256:}  ghcr.io/punterdigital/${image}" >> "$subjects"
+          done
+          cat "$subjects"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/subjects.txt
+
+  assets:
+    name: Check release assets
+    needs: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Every expected asset is attached
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          names=$(gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          missing=0
+          for want in \
+            checksums.txt \
+            arkeep-server_linux_amd64.tar.gz arkeep-server_linux_arm64.tar.gz \
+            arkeep-server_darwin_amd64.tar.gz arkeep-server_darwin_arm64.tar.gz \
+            arkeep-agent_linux_amd64.tar.gz arkeep-agent_linux_arm64.tar.gz \
+            arkeep-agent_linux_arm.tar.gz arkeep-agent_linux_mips.tar.gz arkeep-agent_linux_mipsle.tar.gz \
+            arkeep-agent_darwin_amd64.tar.gz arkeep-agent_darwin_arm64.tar.gz \
+            arkeep-agent_windows_amd64.zip; do
+            if ! grep -qx "$want" <<<"$names"; then echo "::error::Missing asset ${want}"; missing=1; fi
+          done
+          gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --json isPrerelease,isDraft --jq 'if .isPrerelease or .isDraft then error("release is a draft or pre-release") else "published" end'
+          exit "$missing"
