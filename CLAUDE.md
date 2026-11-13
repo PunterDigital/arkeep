@@ -106,10 +106,11 @@ tar --exclude=./gui/node_modules --exclude=./e2e/node_modules --exclude=./.git -
 
 ## Quirks
 
-- On Windows, 3 GUI test files fail to load (`file:///icons/...` / `file:///login-bg.mp4`
-  isn't an absolute path to Node): only Windows, CI on Linux is green.
-- In the golang container the agent's `TestEnsureWritableDir/read-only_leaf` fails: it runs as
-  root, which ignores read-only permissions. CI runs as a normal user.
+- GUI tests on Windows: the Vue compiler turns `src="/icons/..."` into an import, and Vitest's
+  module runner rejects `file:///icons/...` there. `gui/vitest.config.ts` resolves public-dir
+  assets to a virtual module (#4560). Keep it when syncing.
+- The agent's `TestEnsureWritableDir/read-only_leaf` skips under root (the golang container
+  runs as root, which ignores read-only permissions) (#4560).
 - A signed-out GUI page logs `401 (Unauthorized)` console errors (session probe): the E2E
   ignores exactly those.
 - First-run setup has a window (900 s) after server start; a restart reopens it.

@@ -17,9 +17,10 @@ disabled on this fork (repository setting; the files are unchanged).
 
 ## App changes
 
-None yet. Each one gets a row here: what it does, why, the files it touches, and the
+Each one gets a row here: what it does, why, the files it touches, and the
 upstream PR if it was sent upstream (cards tagged `upstream` are; see `CLAUDE.md`). A row
 leaves this table once an upstream release includes the change.
 
 | Change | Why | Files | Upstream |
 |---|---|---|---|
+| Test suites run on Windows and as root: Vitest resolves public-dir assets (`/icons/…`, `/login-bg.mp4`) to a module exporting the URL; the agent's read-only-leaf test skips under root | 3 GUI test files never loaded on Windows; the agent test failed in a root container (card #4560). Tests only, no app change | `gui/vitest.config.ts`, `agent/internal/executor/executor_test.go` | Not sent yet (branch `fix/test-portability`) |
