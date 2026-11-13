@@ -18,7 +18,8 @@ disabled on this fork (repository setting; the files are unchanged).
 ## App changes
 
 None yet. Each one gets a row here: what it does, why, the files it touches, and the
-upstream PR if it was sent upstream.
+upstream PR if it was sent upstream (cards tagged `upstream` are; see `CLAUDE.md`). A row
+leaves this table once an upstream release includes the change.
 
 | Change | Why | Files | Upstream |
 |---|---|---|---|
