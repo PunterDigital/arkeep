@@ -70,6 +70,11 @@ For an `upstream` card:
    `PATCHES.md`, `e2e/`, `pd-*` workflows, `.goreleaser.pd.yml`, `.claude/` or other notes of
    ours, and no edits to upstream's docs unless the card asks for it. Before pushing, check:
    `git diff --name-only upstream/develop...HEAD` must list only code/test files.
+   **No Claude attribution** in anything that goes upstream (Shay, Nov 13): no
+   `Co-Authored-By: Claude …` trailer in the commits and no "Generated with Claude Code" line in
+   the PR body, whatever the session's default attribution says. Check with
+   `git log upstream/develop..HEAD --format=%B | grep -i claude` (must print nothing). Our own
+   carry-over PR on `main` (step 3) keeps the normal attribution.
 2. Push the branch to our fork and open the PR against `arkeep-io/arkeep:develop`.
 3. Carry it in our build: cherry-pick onto a `claude/<card>-<slug>` branch from our `main`, add a
    `PATCHES.md` row with the upstream PR link, our PR, squash-merge, then release `-pd.N+1`.
