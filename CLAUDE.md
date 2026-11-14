@@ -111,6 +111,14 @@ tar --exclude=./gui/node_modules --exclude=./e2e/node_modules --exclude=./.git -
   assets to a virtual module (#4560). Keep it when syncing.
 - The agent's `TestEnsureWritableDir/read-only_leaf` skips under root (the golang container
   runs as root, which ignores read-only permissions) (#4560).
+- Local destinations inside a container must be on a mount (#4568, `durability.go`): the agent
+  reads `/proc/self/mountinfo` whenever a host root is set. Test executors built with a host root
+  (the restore/backup E2E env) set `mountInfo = nil`, since their fake host root is a temp dir on
+  `/`. To check the detector for real, run a throwaway test in `golang:1.27` with
+  `--mount type=volume,dst=/backups --tmpfs /scratch` (Git Bash needs `MSYS_NO_PATHCONV=1`).
+- In-place vs folder restore (#4569): a folder restore recreates the full path under the target,
+  so a target equal to (or above) the original location is refused by the server
+  (`restore_target.go`) and the agent. "Original location" sends target `/`.
 - A signed-out GUI page logs `401 (Unauthorized)` console errors (session probe): the E2E
   ignores exactly those.
 - First-run setup has a window (900 s) after server start; a restart reopens it.
