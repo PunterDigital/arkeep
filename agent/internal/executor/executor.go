@@ -211,6 +211,11 @@ type Executor struct {
 	// agent runs in; "" for a native agent or when it cannot be told.
 	selfContainerID string
 
+	// mountInfo returns the agent's /proc/self/mountinfo. It is set only
+	// inside a container (dockerHostRoot set), where a local destination
+	// must be on a mount to outlive the container; nil skips the check.
+	mountInfo func() ([]byte, error)
+
 	// cancelledMu protects cancelled — jobs marked for cancellation before
 	// they are dequeued. Populated by Cancel() when a job is still queued.
 	cancelledMu sync.Mutex
@@ -268,6 +273,7 @@ func New(
 	// container's data to protect (see buildInPlaceExcludes).
 	if dockerHostRoot != "" {
 		e.selfContainerID = docker.SelfContainerID()
+		e.mountInfo = readSelfMountInfo
 	}
 	return e
 }
@@ -663,6 +669,12 @@ func (e *Executor) executeBackup(ctx context.Context, job JobAssignment, sink Lo
 						dest.RepoURL, originalURL, e.dockerHostRoot, err,
 					)
 				}
+				log("error", fmt.Sprintf("backup to destination %s failed: %s", dest.DestinationID, errMsg))
+				reporter.ReportDestinationResult(job.JobID, dest.DestinationID, "failed", "", destStartedAt, 0, 0, errMsg)
+				backupFailed = true
+				continue
+			}
+			if errMsg := e.nonDurableLocalPath(dest.RepoURL, originalURL); errMsg != "" {
 				log("error", fmt.Sprintf("backup to destination %s failed: %s", dest.DestinationID, errMsg))
 				reporter.ReportDestinationResult(job.JobID, dest.DestinationID, "failed", "", destStartedAt, 0, 0, errMsg)
 				backupFailed = true
