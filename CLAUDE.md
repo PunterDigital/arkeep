@@ -106,6 +106,11 @@ tar --exclude=./gui/node_modules --exclude=./e2e/node_modules --exclude=./.git -
 
 ## Quirks
 
+- **`gh pr create` in this checkout targets upstream unless told otherwise**: gh picks a fork's
+  parent as the default repo. A docs PR meant for our fork went to arkeep-io/arkeep as #496
+  (closed within a minute, Nov 21). `gh repo set-default PunterDigital/arkeep` is now set locally,
+  but a fresh clone or worktree won't have it: always pass `-R PunterDigital/arkeep` (ours) or
+  `-R arkeep-io/arkeep` (upstream) explicitly.
 - GUI tests on Windows: the Vue compiler turns `src="/icons/..."` into an import, and Vitest's
   module runner rejects `file:///icons/...` there. `gui/vitest.config.ts` resolves public-dir
   assets to a virtual module (#4560). Keep it when syncing.
