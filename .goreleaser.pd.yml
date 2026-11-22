@@ -11,7 +11,10 @@ project_name: arkeep
 
 before:
   hooks:
-    - sh -c "cd gui && pnpm install --frozen-lockfile && pnpm build"
+    # The GUI is built before GoReleaser runs, never by it: in release-pd.yml
+    # by a job without write permissions (as upstream's ADR 0021), elsewhere
+    # with `task build:gui`.
+    - "sh -c 'test -f gui/dist/index.html || { echo \"gui/dist/index.html is missing, run task build:gui first\" >&2; exit 1; }'"
     - sh -c "mkdir -p server/cmd/server/dist && cp -r gui/dist/. server/cmd/server/dist"
     - sh -c "cd agent && go run ./scripts/download_deps.go --all-platforms"
 
@@ -192,7 +195,10 @@ release:
     Patched build of upstream [Arkeep {{ envOrDefault "UPSTREAM_BASE" "" }}](https://github.com/arkeep-io/arkeep/releases/tag/{{ envOrDefault "UPSTREAM_BASE" "" }}) by PunterDigital. What differs from upstream is listed in [PATCHES.md](https://github.com/PunterDigital/arkeep/blob/{{ .Tag }}/PATCHES.md).
 
     > [!IMPORTANT]
-    > Database migrations run automatically when the server starts. Back up your database (or the `data/` volume) before upgrading — see [Upgrading](https://arkeep.io/docs/installation/upgrading/).
+    > Upgrade in this order — see [Upgrading](https://arkeep.io/docs/installation/upgrading/):
+    > 1. Back up the database (or the `data/` volume): migrations run automatically when the server starts.
+    > 2. Upgrade the server and check that `/health/ready` reports `healthy`.
+    > 3. Then upgrade the agents. An agent refuses to enroll with a server older than itself.
 
     ## Install
 

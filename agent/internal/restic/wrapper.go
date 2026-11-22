@@ -16,6 +16,7 @@ package restic
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -103,6 +105,22 @@ func (w *Wrapper) prepareRepository(ctx context.Context, dest Destination) error
 	return nil
 }
 
+// incompleteSnapshotExitCode is restic's exit status when the backup created a
+// snapshot but could not read some source files (restic 0.10+).
+const incompleteSnapshotExitCode = 3
+
+// ErrIncompleteSnapshot is returned, together with a BackupResult, when restic
+// created the snapshot but skipped files it could not read. The snapshot
+// exists in the repository: callers keep its ID (R-12, R-16).
+var ErrIncompleteSnapshot = errors.New("restic: snapshot created, but some files could not be read")
+
+// incompleteBackup reports whether err is restic's "snapshot created, some
+// files unreadable" exit and the run produced a snapshot.
+func incompleteBackup(err error, result *BackupResult) bool {
+	var exitErr *exec.ExitError
+	return result.SnapshotID != "" && errors.As(err, &exitErr) && exitErr.ExitCode() == incompleteSnapshotExitCode
+}
+
 // backupError turns restic's "repository does not exist" exit status into a
 // RepositoryNotFoundError when the repository must exist; other errors are
 // returned unchanged.
@@ -169,15 +187,42 @@ type SnapshotInfo struct {
 	Summary SnapshotSummary `json:"summary"`
 }
 
-// SnapshotSummary holds the subset of a snapshot's stored statistics that is
-// needed to report its size, as emitted by `restic snapshots --json`.
+// SnapshotSummary holds the statistics restic records about a snapshot. It
+// decodes both the summary stored in a snapshot (`restic snapshots --json`)
+// and the summary event of `restic backup --json`, which carry the same
+// fields.
 type SnapshotSummary struct {
-	// DataAddedPacked is the footprint the snapshot added to the repository
-	// after compression and deduplication — the same metric recorded for
-	// snapshots produced by a backup.
-	DataAddedPacked int64 `json:"data_added_packed"`
-	// TotalFilesProcessed is the number of files the snapshot covered.
+	// BackupStart and BackupEnd bound the restic run that created the
+	// snapshot. Zero when restic recorded no summary.
+	BackupStart time.Time `json:"backup_start"`
+	BackupEnd   time.Time `json:"backup_end"`
+	// FilesNew, FilesChanged and FilesUnmodified count the files by how they
+	// compare with the parent snapshot.
+	FilesNew        int64 `json:"files_new"`
+	FilesChanged    int64 `json:"files_changed"`
+	FilesUnmodified int64 `json:"files_unmodified"`
+	// TotalFilesProcessed and TotalBytesProcessed are the number and the
+	// logical size of the files the backup read.
 	TotalFilesProcessed int64 `json:"total_files_processed"`
+	TotalBytesProcessed int64 `json:"total_bytes_processed"`
+	// DataAdded is what the snapshot added to the repository after
+	// deduplication.
+	DataAdded int64 `json:"data_added"`
+	// DataAddedPacked is the footprint the snapshot added to the repository
+	// after compression and deduplication — the size recorded for snapshots.
+	DataAddedPacked int64 `json:"data_added_packed"`
+}
+
+// AddedBytes is the footprint the snapshot added to the repository:
+// DataAddedPacked, or DataAdded when restic reported no packed size. It is
+// recorded as the snapshot's size so per-snapshot and per-day figures
+// reconcile with the destination's real repo size — TotalBytesProcessed is
+// the logical source size and would double-count across snapshots.
+func (s SnapshotSummary) AddedBytes() int64 {
+	if s.DataAddedPacked == 0 {
+		return s.DataAdded
+	}
+	return s.DataAddedPacked
 }
 
 // RetentionPolicy mirrors the keep_* fields from db.Policy.
@@ -214,15 +259,8 @@ type ProgressEvent struct {
 
 	// Summary-only fields — only present when MessageType == "summary".
 	// SnapshotID is the full SHA256 ID of the snapshot created by this backup run.
+	// The other summary figures are decoded from Raw (see summaryInterceptor).
 	SnapshotID string `json:"snapshot_id"`
-	// TotalBytesProcessed is the total size of all source files examined.
-	TotalBytesProcessed uint64 `json:"total_bytes_processed"`
-	// DataAdded is the number of new bytes added to the repository (deduplicated,
-	// before compression).
-	DataAdded uint64 `json:"data_added"`
-	// DataAddedPacked is the compressed bytes actually written to the repository
-	// by this backup (deduplicated + compressed) — the real incremental footprint.
-	DataAddedPacked uint64 `json:"data_added_packed"`
 
 	// Raw is the original JSON line, forwarded as-is to the log stream.
 	Raw string `json:"-"`
@@ -235,13 +273,8 @@ type BackupResult struct {
 	// SnapshotID is the full ID of the snapshot created by this run.
 	// Empty if the backup failed before creating a snapshot.
 	SnapshotID string
-	// TotalBytesProcessed is the total size of all files examined.
-	TotalBytesProcessed uint64
-	// DataAdded is the net bytes added to the repository after deduplication.
-	DataAdded uint64
-	// DataAddedPacked is the compressed bytes actually written to the repository
-	// by this run — the real incremental footprint on disk.
-	DataAddedPacked uint64
+	// Summary holds the figures of the restic summary event.
+	Summary SnapshotSummary
 }
 
 // ProgressFunc is called for each progress event emitted during a long-running
@@ -256,6 +289,13 @@ type Wrapper struct {
 	resticBin string // absolute path to the extracted restic binary
 	rcloneBin string // absolute path to the extracted rclone binary
 	logger    *zap.Logger
+
+	// cacheDir is restic's cache directory, under the agent's state directory
+	// so that it outlives a container recreate: without it restic falls back
+	// to $HOME/.cache, which in Docker is not on a volume, and downloads every
+	// repository's index again after each image update (#455). Empty means
+	// restic's own default. Applied in buildCmd.
+	cacheDir string
 
 	// knownHostsDir is a private (0700) directory, created on first use, that
 	// holds the known_hosts files of SFTP destinations with a pinned host key.
@@ -281,6 +321,7 @@ func NewWrapper(extractor *Extractor, logger *zap.Logger) (*Wrapper, error) {
 		resticBin: resticBin,
 		rcloneBin: rcloneBin,
 		logger:    logger.Named("restic"),
+		cacheDir:  filepath.Join(extractor.stateDir, "cache"),
 	}, nil
 }
 
@@ -341,7 +382,9 @@ func buildBackupArgs(opts BackupOptions, goos string) []string {
 //
 // Returns a BackupResult with snapshot metadata extracted from the restic
 // summary event, and an error if the backup fails. A non-zero restic exit
-// code is always wrapped in the returned error with stderr included.
+// code is always wrapped in the returned error with stderr included. When
+// restic created the snapshot but could not read some files (exit 3), both
+// the result and an error wrapping ErrIncompleteSnapshot are returned.
 func (w *Wrapper) Backup(ctx context.Context, dest Destination, opts BackupOptions, onProgress ProgressFunc) (*BackupResult, error) {
 	if err := w.prepareRepository(ctx, dest); err != nil {
 		return nil, err
@@ -351,6 +394,9 @@ func (w *Wrapper) Backup(ctx context.Context, dest Destination, opts BackupOptio
 
 	var result BackupResult
 	if err := w.runWithProgress(ctx, dest, args, summaryInterceptor(&result, onProgress)); err != nil {
+		if incompleteBackup(err, &result) {
+			return &result, fmt.Errorf("%w (snapshot %s): %w", ErrIncompleteSnapshot, result.SnapshotID, err)
+		}
 		return nil, backupError(dest, err)
 	}
 	return &result, nil
@@ -364,9 +410,11 @@ func summaryInterceptor(result *BackupResult, onProgress ProgressFunc) ProgressF
 	return func(ev ProgressEvent) error {
 		if ev.MessageType == "summary" {
 			result.SnapshotID = ev.SnapshotID
-			result.TotalBytesProcessed = ev.TotalBytesProcessed
-			result.DataAdded = ev.DataAdded
-			result.DataAddedPacked = ev.DataAddedPacked
+			// The line already decoded as a ProgressEvent, so it is valid
+			// JSON: an error can only be a field of an unexpected type, which
+			// is left at zero. The figures are informational, the snapshot
+			// exists either way.
+			_ = json.Unmarshal([]byte(ev.Raw), &result.Summary)
 		}
 		if onProgress != nil {
 			return onProgress(ev)
@@ -465,7 +513,10 @@ func buildForgetArgs(policy RetentionPolicy, tags []string) ([]string, error) {
 	// group alone, so old groups were never pruned (#284). Every Arkeep
 	// snapshot carries exactly one pool tag, so grouping by tags keeps each
 	// pool separate — also when a sweep passes several pools' tags at once.
-	args := []string{"forget", "--prune", "--json", "--group-by", "paths,tags"}
+	// --cleanup-cache removes the cache directories of repositories this
+	// agent has not used for 30 days (a destination deleted or moved), which
+	// restic otherwise keeps forever in the persistent cache.
+	args := []string{"forget", "--prune", "--json", "--cleanup-cache", "--group-by", "paths,tags"}
 	for _, tag := range tags {
 		args = append(args, "--tag", tag)
 	}
@@ -607,6 +658,86 @@ func (w *Wrapper) Snapshots(ctx context.Context, dest Destination) ([]SnapshotIn
 	return snapshots, nil
 }
 
+// SnapshotsFailFast is Snapshots for someone waiting on the answer, such as an
+// import of an existing repository. restic retries a failed backend request
+// with backoff for many minutes, even when the connection is refused, so the
+// caller would give up long before learning why. SnapshotsFailFast stops restic
+// at the first retried request and returns that request's error instead.
+func (w *Wrapper) SnapshotsFailFast(ctx context.Context, dest Destination) ([]SnapshotInfo, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var stdout bytes.Buffer
+	stderr := &retryWatcher{onRetry: cancel}
+	cmd := w.buildCmd(ctx, dest, []string{"snapshots", "--json", "--no-lock"})
+	cmd.Stdout = &stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	if stderr.cause != "" {
+		return nil, fmt.Errorf("restic: cannot reach the repository: %s", stderr.cause)
+	}
+	if err != nil {
+		return nil, commandError(err, stderr.buf.String())
+	}
+
+	var snapshots []SnapshotInfo
+	if err := json.Unmarshal(stdout.Bytes(), &snapshots); err != nil {
+		return nil, fmt.Errorf("restic: failed to parse snapshots output: %w", err)
+	}
+	return snapshots, nil
+}
+
+// retryMarker introduces the error in the line restic writes to stderr before
+// retrying a failed backend request, e.g.
+//
+//	Stat(<config/>) returned error, retrying after 1.46s: Head "http://:***@host/config": dial tcp host: connect: connection refused
+//
+// restic redacts the password in the URL it prints.
+const retryMarker = " returned error, retrying after "
+
+// retryWatcher collects a restic command's stderr and calls onRetry once, at
+// the first line announcing a retried backend request, keeping its error in
+// cause. exec writes stderr from a single goroutine, and cause is read after
+// the command has finished.
+type retryWatcher struct {
+	buf     bytes.Buffer
+	partial []byte
+	cause   string
+	onRetry func()
+}
+
+func (r *retryWatcher) Write(p []byte) (int, error) {
+	r.buf.Write(p)
+	r.partial = append(r.partial, p...)
+	for {
+		i := bytes.IndexByte(r.partial, '\n')
+		if i < 0 {
+			break
+		}
+		r.checkLine(string(r.partial[:i]))
+		r.partial = r.partial[i+1:]
+	}
+	return len(p), nil
+}
+
+func (r *retryWatcher) checkLine(line string) {
+	if r.cause != "" {
+		return
+	}
+	i := strings.Index(line, retryMarker)
+	if i < 0 {
+		return
+	}
+	// Skip the delay ("1.46s: ") that follows the marker.
+	rest := line[i+len(retryMarker):]
+	j := strings.Index(rest, ": ")
+	if j < 0 {
+		return
+	}
+	r.cause = strings.TrimSpace(rest[j+2:])
+	r.onRetry()
+}
+
 // Restore restores a snapshot (or specific paths within it) to targetDir.
 // snapshotID may be "latest" to restore the most recent snapshot.
 // includePaths, if non-empty, limits restoration to those sub-paths inside the
@@ -681,14 +812,12 @@ func buildRestoreArgs(snapshotID, targetDir string, includePaths []string, exclu
 // entry itself are skipped, so the result is exactly the directory's children.
 // dir defaults to "/" (the snapshot root) when empty.
 //
-// The "--" end-of-options marker separates flags from the positional snapshotID
-// and dir, so a dir that begins with "-" (it originates from a user-supplied
-// ?path= query) can never be interpreted by restic as a flag.
+// See buildLsArgs for the flags.
 func (w *Wrapper) Ls(ctx context.Context, dest Destination, snapshotID, dir string) ([]LsEntry, error) {
 	if dir == "" {
 		dir = "/"
 	}
-	cmd := w.buildCmd(ctx, dest, []string{"ls", "--json", "--", snapshotID, dir})
+	cmd := w.buildCmd(ctx, dest, buildLsArgs(snapshotID, dir))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("restic: failed to open stdout pipe: %w", err)
@@ -735,7 +864,7 @@ func (w *Wrapper) Ls(ctx context.Context, dest Destination, snapshotID, dir stri
 		})
 	}
 	if err := scanner.Err(); err != nil {
-		_ = cmd.Process.Kill()
+		killAndWait(cmd)
 		return nil, fmt.Errorf("restic: error reading ls output: %w", err)
 	}
 
@@ -760,6 +889,20 @@ func (w *Wrapper) Dump(ctx context.Context, dest Destination, snapshotID, path s
 		return commandError(err, stderrBuf.String())
 	}
 	return nil
+}
+
+// buildLsArgs constructs the restic ls argument slice.
+//
+// --no-lock: listing only reads the repository. Without it every directory
+// opened in the GUI creates and deletes a lock file on the backend (two
+// round trips on a remote one), and browsing fails while a prune holds the
+// exclusive lock.
+//
+// The "--" end-of-options marker separates flags from the positional snapshotID
+// and dir, so a dir that begins with "-" (it originates from a user-supplied
+// ?path= query) can never be interpreted by restic as a flag.
+func buildLsArgs(snapshotID, dir string) []string {
+	return []string{"ls", "--json", "--no-lock", "--", snapshotID, dir}
 }
 
 // buildDumpArgs constructs the restic dump argument slice. As in Ls, the "--"
@@ -809,7 +952,7 @@ func (w *Wrapper) Stats(ctx context.Context, dest Destination) (StatsResult, err
 
 	res, found, parseErr := parseResticStats(stdout)
 	if parseErr != nil {
-		_ = cmd.Process.Kill()
+		killAndWait(cmd)
 		return StatsResult{}, fmt.Errorf("restic: error reading stats output: %w", parseErr)
 	}
 
@@ -884,6 +1027,7 @@ func (w *Wrapper) runRestoreJSON(ctx context.Context, dest Destination, args []s
 			}
 		}
 		if err := scanner.Err(); err != nil {
+			killAndWait(cmd)
 			return fmt.Errorf("restic: failed to read stdout: %w", err)
 		}
 
@@ -1067,7 +1211,30 @@ func errorMessage(stderr string) string {
 	if len(details) > 0 {
 		msg += ": " + strings.Join(details, "; ")
 	}
+	if hint := missingRcloneRemote(stderr); hint != "" {
+		msg += ": " + hint
+	}
 	return msg
+}
+
+// rcloneMissingRemote matches rclone's plain-text stderr line for a remote
+// that is not in its config file. restic's own exit_error only says "error
+// talking HTTP to rclone", so without it the cause would be lost.
+var rcloneMissingRemote = regexp.MustCompile(`didn't find section in config file \("([^"]*)"\)`)
+
+// missingRcloneRemote explains a missing rclone remote found in stderr, naming
+// the config file rclone read (it inherits RCLONE_CONFIG from the agent; the
+// Docker image sets it). It returns "" when stderr reports no such error.
+func missingRcloneRemote(stderr string) string {
+	m := rcloneMissingRemote.FindStringSubmatch(stderr)
+	if m == nil {
+		return ""
+	}
+	config := os.Getenv("RCLONE_CONFIG")
+	if config == "" {
+		config = "rclone's default config file (~/.config/rclone/rclone.conf of the user running the agent)"
+	}
+	return fmt.Sprintf("rclone remote %q is not defined in %s", m[1], config)
 }
 
 // lockConflictExitCode is restic's dedicated, stable exit status for "unable
@@ -1204,13 +1371,13 @@ func (w *Wrapper) runWithProgress(ctx context.Context, dest Destination, args []
 			if onProgress != nil {
 				if err := onProgress(event); err != nil {
 					// Caller signalled cancellation — kill the process.
-					// Ignore the kill error: the process may have already exited.
-					_ = cmd.Process.Kill()
+					killAndWait(cmd)
 					return fmt.Errorf("restic: progress callback cancelled: %w", err)
 				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
+			killAndWait(cmd)
 			return fmt.Errorf("restic: failed to read stdout: %w", err)
 		}
 
@@ -1219,6 +1386,15 @@ func (w *Wrapper) runWithProgress(ctx context.Context, dest Destination, args []
 		}
 		return nil
 	})
+}
+
+// killAndWait stops a restic process the caller gave up on and waits for it,
+// so that it does not linger as a zombie holding its pipes (R-12). Errors are
+// ignored: the process may already have exited, and the caller is returning
+// its own error.
+func killAndWait(cmd *exec.Cmd) {
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
 }
 
 // buildCmd constructs the exec.Cmd for a restic invocation.
@@ -1256,6 +1432,11 @@ func (w *Wrapper) buildCmd(ctx context.Context, dest Destination, args []string)
 		"RESTIC_REPOSITORY="+dest.RepoURL,
 		"RESTIC_PASSWORD="+dest.Password,
 	)
+	// An operator who chose a cache location keeps it: restic reads
+	// RESTIC_CACHE_DIR first, then XDG_CACHE_HOME.
+	if w.cacheDir != "" && os.Getenv("RESTIC_CACHE_DIR") == "" && os.Getenv("XDG_CACHE_HOME") == "" {
+		env = append(env, "RESTIC_CACHE_DIR="+w.cacheDir)
+	}
 
 	allowed, rejected := filterDestEnv(dest.Env)
 	if len(rejected) > 0 {
