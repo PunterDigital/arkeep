@@ -2,6 +2,7 @@ package restic
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -394,6 +395,51 @@ func TestBuildCmd_NonRcloneNoRcloneProgram(t *testing.T) {
 	}
 }
 
+// TestBuildCmd_ResticCacheDir: restic keeps its cache under the agent's state
+// directory, which outlives a container recreate, unless the operator chose a
+// cache location with RESTIC_CACHE_DIR or XDG_CACHE_HOME (#455).
+func TestBuildCmd_ResticCacheDir(t *testing.T) {
+	tests := []struct {
+		name     string
+		cacheDir string
+		env      map[string]string
+		want     string
+	}{
+		{"default under the state dir", "/state/cache", nil, "/state/cache"},
+		{"RESTIC_CACHE_DIR set by the operator", "/state/cache", map[string]string{"RESTIC_CACHE_DIR": "/fast/cache"}, "/fast/cache"},
+		{"XDG_CACHE_HOME set by the operator", "/state/cache", map[string]string{"XDG_CACHE_HOME": "/data/cache"}, ""},
+		{"empty RESTIC_CACHE_DIR counts as unset", "/state/cache", map[string]string{"RESTIC_CACHE_DIR": ""}, "/state/cache"},
+		{"no cache dir configured", "", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range []string{"RESTIC_CACHE_DIR", "XDG_CACHE_HOME"} {
+				t.Setenv(k, "") // restored after the test
+				if v, ok := tt.env[k]; ok {
+					t.Setenv(k, v)
+				} else if err := os.Unsetenv(k); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w := &Wrapper{resticBin: "/fake/restic", rcloneBin: "/fake/rclone", cacheDir: tt.cacheDir}
+			dest := Destination{Type: DestLocal, RepoURL: "/mnt/backups"}
+
+			cmd := w.buildCmd(context.Background(), dest, []string{"snapshots"})
+
+			// exec uses the last value of a duplicated variable.
+			got := ""
+			for _, kv := range cmd.Env {
+				if v, ok := strings.CutPrefix(kv, "RESTIC_CACHE_DIR="); ok {
+					got = v
+				}
+			}
+			if got != tt.want {
+				t.Errorf("RESTIC_CACHE_DIR = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // hasRcloneProgramOpt reports whether args contains the consecutive pair
 // "-o" "rclone.program=<bin>".
 func hasRcloneProgramOpt(args []string, bin string) bool {
@@ -472,7 +518,7 @@ func TestBuildForgetArgs(t *testing.T) {
 			policy: RetentionPolicy{Daily: 7},
 			tags:   []string{"policy:11111111-2222-3333-4444-555555555555"},
 			want: []string{
-				"forget", "--prune", "--json", "--group-by", "paths,tags",
+				"forget", "--prune", "--json", "--cleanup-cache", "--group-by", "paths,tags",
 				"--tag", "policy:11111111-2222-3333-4444-555555555555",
 				"--keep-daily", "7",
 			},
@@ -482,7 +528,7 @@ func TestBuildForgetArgs(t *testing.T) {
 			policy: RetentionPolicy{Last: 1, Hourly: 2, Daily: 3, Weekly: 4, Monthly: 5, Yearly: 6},
 			tags:   []string{"policy:abc"},
 			want: []string{
-				"forget", "--prune", "--json", "--group-by", "paths,tags", "--tag", "policy:abc",
+				"forget", "--prune", "--json", "--cleanup-cache", "--group-by", "paths,tags", "--tag", "policy:abc",
 				"--keep-last", "1", "--keep-hourly", "2", "--keep-daily", "3",
 				"--keep-weekly", "4", "--keep-monthly", "5", "--keep-yearly", "6",
 			},
@@ -492,7 +538,7 @@ func TestBuildForgetArgs(t *testing.T) {
 			policy: RetentionPolicy{Weekly: 4},
 			tags:   []string{"policy:abc"},
 			want: []string{
-				"forget", "--prune", "--json", "--group-by", "paths,tags", "--tag", "policy:abc",
+				"forget", "--prune", "--json", "--cleanup-cache", "--group-by", "paths,tags", "--tag", "policy:abc",
 				"--keep-weekly", "4",
 			},
 		},
@@ -501,7 +547,7 @@ func TestBuildForgetArgs(t *testing.T) {
 			policy: RetentionPolicy{Last: 1},
 			tags:   []string{"policy:abc", "env:prod"},
 			want: []string{
-				"forget", "--prune", "--json", "--group-by", "paths,tags",
+				"forget", "--prune", "--json", "--cleanup-cache", "--group-by", "paths,tags",
 				"--tag", "policy:abc", "--tag", "env:prod",
 				"--keep-last", "1",
 			},
@@ -521,7 +567,7 @@ func TestBuildForgetArgs(t *testing.T) {
 			policy: RetentionPolicy{Last: 7},
 			tags:   []string{"policy:abc:command:pgdump"},
 			want: []string{
-				"forget", "--prune", "--json", "--group-by", "paths,tags",
+				"forget", "--prune", "--json", "--cleanup-cache", "--group-by", "paths,tags",
 				"--tag", "policy:abc:command:pgdump",
 				"--keep-last", "7",
 			},
@@ -729,6 +775,30 @@ func TestBuildDumpArgs(t *testing.T) {
 	}
 }
 
+// TestBuildLsArgs: browsing a snapshot only reads the repository, so it takes
+// no lock — no lock file round trip on a remote backend, and no failure while
+// a prune holds the exclusive lock (#455). The "--" marker keeps a dir
+// beginning with "-" from being read as a flag.
+func TestBuildLsArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		dir  string
+		want []string
+	}{
+		{"snapshot root", "/", []string{"ls", "--json", "--no-lock", "--", "abc123", "/"}},
+		{"subdirectory", "/etc", []string{"ls", "--json", "--no-lock", "--", "abc123", "/etc"}},
+		{"dir looking like a flag", "--password-command=id", []string{"ls", "--json", "--no-lock", "--", "abc123", "--password-command=id"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildLsArgs("abc123", tt.dir)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("buildLsArgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildCheckArgs(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -838,6 +908,61 @@ exit 10
 	return script, calls
 }
 
+// TestBackup_IncompleteSnapshot covers restic's exit 3 (R-12): the snapshot is
+// created but some files could not be read. The result is kept with an error
+// wrapping ErrIncompleteSnapshot; any other failure, or an exit 3 without a
+// snapshot, is a plain error without a result.
+func TestBackup_IncompleteSnapshot(t *testing.T) {
+	const summary = `{"message_type":"summary","snapshot_id":"3f2a9c1e5b7d","files_new":2,"total_files_processed":2}`
+	tests := []struct {
+		name           string
+		stdout         string
+		exit           int
+		wantIncomplete bool
+	}{
+		{"exit 3 with a snapshot", summary, 3, true},
+		{"exit 3 without a snapshot", "", 3, false},
+		{"exit 1 with a summary", summary, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := filepath.Join(dir, "fake-restic.sh")
+			body := fmt.Sprintf("#!/bin/sh\n[ \"$1\" = \"init\" ] && exit 0\necho '%s'\n"+
+				"echo 'error: open /data/locked: permission denied' >&2\nexit %d\n", tt.stdout, tt.exit)
+			if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			w := &Wrapper{resticBin: script, rcloneBin: "/fake/rclone", logger: zap.NewNop()}
+			dest := Destination{Type: DestLocal, RepoURL: filepath.Join(dir, "repo"), Password: "pw", MustExist: true}
+
+			result, err := w.Backup(context.Background(), dest, BackupOptions{Sources: []string{"/data"}}, nil)
+			if err == nil {
+				t.Fatal("Backup succeeded, want an error")
+			}
+			if got := errors.Is(err, ErrIncompleteSnapshot); got != tt.wantIncomplete {
+				t.Fatalf("errors.Is(err, ErrIncompleteSnapshot) = %v, want %v; err = %v", got, tt.wantIncomplete, err)
+			}
+			if !tt.wantIncomplete {
+				if result != nil {
+					t.Errorf("result = %+v, want nil", result)
+				}
+				return
+			}
+			if result == nil || result.SnapshotID != "3f2a9c1e5b7d" {
+				t.Fatalf("result = %+v, want the snapshot of the incomplete backup", result)
+			}
+			if result.Summary.FilesNew != 2 {
+				t.Errorf("summary files_new = %d, want 2", result.Summary.FilesNew)
+			}
+			// The unreadable file stays in the message shown to the admin.
+			if !strings.Contains(err.Error(), "/data/locked") {
+				t.Errorf("error %q does not name the unreadable file", err)
+			}
+		})
+	}
+}
+
 // TestBackup_RepositoryThatMustExist covers a repository that has gone missing
 // (an unmounted disk): when it is known to exist the backup must neither run
 // `restic init` nor report a plain restic failure, but ErrRepositoryNotFound.
@@ -926,6 +1051,48 @@ func TestErrorMessage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if got := errorMessage(tt.stderr); got != tt.want {
+				t.Errorf("errorMessage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestErrorMessage_MissingRcloneRemote checks that a remote missing from
+// rclone.conf is named, with the config file rclone read: restic's exit_error
+// alone only says "error talking HTTP to rclone" (issue #463).
+func TestErrorMessage_MissingRcloneRemote(t *testing.T) {
+	const exitErr = `{"message_type":"exit_error","code":1,"message":"Fatal: Fatal: create repository at rclone:gdrive:repo failed: error talking HTTP to rclone: exit status 1"}` + "\n"
+	const rcloneLine = `rclone: 2026/11/16 15:42:48 CRITICAL: Failed to create file system for "gdrive:repo": didn't find section in config file ("gdrive")` + "\n"
+	const base = "Fatal: create repository at rclone:gdrive:repo failed: error talking HTTP to rclone: exit status 1"
+
+	tests := []struct {
+		name         string
+		rcloneConfig string
+		stderr       string
+		want         string
+	}{
+		{
+			name:         "RCLONE_CONFIG set",
+			rcloneConfig: "/etc/arkeep/rclone/rclone.conf",
+			stderr:       rcloneLine + exitErr,
+			want:         base + `: rclone remote "gdrive" is not defined in /etc/arkeep/rclone/rclone.conf`,
+		},
+		{
+			name:   "default config",
+			stderr: rcloneLine + exitErr,
+			want:   base + `: rclone remote "gdrive" is not defined in rclone's default config file (~/.config/rclone/rclone.conf of the user running the agent)`,
+		},
+		{
+			name:         "other rclone error unchanged",
+			rcloneConfig: "/etc/arkeep/rclone/rclone.conf",
+			stderr:       `rclone: 2026/11/16 15:42:48 CRITICAL: Failed to create file system for "gdrive:repo": couldn't fetch token` + "\n" + exitErr,
+			want:         base,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("RCLONE_CONFIG", tt.rcloneConfig)
 			if got := errorMessage(tt.stderr); got != tt.want {
 				t.Errorf("errorMessage() = %q, want %q", got, tt.want)
 			}
@@ -1090,5 +1257,171 @@ func TestRestore_InPlaceToleratesSELinuxLabelRemoval(t *testing.T) {
 
 	if err := w.Restore(context.Background(), dest, "abc123", "/", nil, nil, ""); err != nil {
 		t.Fatalf("Restore() = %v, want nil: only the SELinux label removal failed", err)
+	}
+}
+
+// writeScript writes a fake restic made of the given shell body.
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "fake-restic.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+// TestSnapshotsFailFast is the regression for issue #448: restic retries an
+// unreachable backend for many minutes, so an import of a REST repository the
+// agent cannot reach outlived the server's wait and its cause was never shown.
+func TestSnapshotsFailFast(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake restic is a shell script")
+	}
+	dest := Destination{Type: DestRest, RepoURL: "rest:http://192.0.2.1:8181/", Password: "pw"}
+
+	t.Run("stops restic at the first retried request and returns its cause", func(t *testing.T) {
+		// The retry line is the one restic 0.19 writes; exec makes sleep the
+		// process that receives the interrupt.
+		script := writeScript(t, `echo 'Stat(<config/>) returned error, retrying after 1.46s: Head "http://:***@192.0.2.1:8181/config": dial tcp 192.0.2.1:8181: connect: connection refused' >&2
+exec sleep 60
+`)
+		w := &Wrapper{resticBin: script, rcloneBin: "/fake/rclone", logger: zap.NewNop()}
+
+		start := time.Now()
+		_, err := w.SnapshotsFailFast(context.Background(), dest)
+		if err == nil {
+			t.Fatal("SnapshotsFailFast() = nil error, want the connection failure")
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Errorf("SnapshotsFailFast() took %s, want it to stop restic at once", elapsed)
+		}
+		want := `restic: cannot reach the repository: Head "http://:***@192.0.2.1:8181/config": dial tcp 192.0.2.1:8181: connect: connection refused`
+		if err.Error() != want {
+			t.Errorf("error = %q\nwant    %q", err, want)
+		}
+	})
+
+	t.Run("returns the snapshots of a reachable repository", func(t *testing.T) {
+		script := writeScript(t, `echo '[{"id":"abc123","time":"2026-11-01T10:00:00Z","paths":["/data"],"hostname":"nas"}]'
+`)
+		w := &Wrapper{resticBin: script, rcloneBin: "/fake/rclone", logger: zap.NewNop()}
+
+		snaps, err := w.SnapshotsFailFast(context.Background(), dest)
+		if err != nil {
+			t.Fatalf("SnapshotsFailFast() = %v, want nil", err)
+		}
+		if len(snaps) != 1 || snaps[0].ID != "abc123" || snaps[0].Hostname != "nas" {
+			t.Errorf("snapshots = %+v, want the one listed", snaps)
+		}
+	})
+
+	t.Run("reports other failures like any restic command", func(t *testing.T) {
+		// check-repo classifies the exit status: it must still be there.
+		script := writeScript(t, `echo '{"message_type":"exit_error","code":10,"message":"Fatal: repository does not exist: unable to open config file"}' >&2
+exit 10
+`)
+		w := &Wrapper{resticBin: script, rcloneBin: "/fake/rclone", logger: zap.NewNop()}
+
+		_, err := w.SnapshotsFailFast(context.Background(), dest)
+		want := "restic: repository does not exist: unable to open config file (exit status 10)"
+		if err == nil || err.Error() != want {
+			t.Errorf("error = %v\nwant    %q", err, want)
+		}
+	})
+}
+
+// resticSummaryLine is the summary event of `restic backup --json`, as
+// restic 0.19 prints it.
+const resticSummaryLine = `{"message_type":"summary","files_new":1,"files_changed":2,"files_unmodified":3,"dirs_new":7,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":1,"tree_blobs":8,"data_added":3066,"data_added_packed":2500,"total_files_processed":6,"total_bytes_processed":4096,"total_duration":0.76,"backup_start":"2026-11-17T09:46:07.33213638+01:00","backup_end":"2026-11-17T09:46:08.093417686+01:00","snapshot_id":"8725bff10a20eaaba50b64cad3d0048e1a0c8343f186b62467aa27c29e199153"}`
+
+// wantResticSummary is resticSummaryLine decoded.
+var wantResticSummary = SnapshotSummary{
+	BackupStart:         time.Date(2026, 11, 17, 8, 46, 7, 332136380, time.UTC),
+	BackupEnd:           time.Date(2026, 11, 17, 8, 46, 8, 93417686, time.UTC),
+	FilesNew:            1,
+	FilesChanged:        2,
+	FilesUnmodified:     3,
+	TotalFilesProcessed: 6,
+	TotalBytesProcessed: 4096,
+	DataAdded:           3066,
+	DataAddedPacked:     2500,
+}
+
+// equalSummary compares summaries with time.Equal, which ignores the zone.
+func equalSummary(a, b SnapshotSummary) bool {
+	if !a.BackupStart.Equal(b.BackupStart) || !a.BackupEnd.Equal(b.BackupEnd) {
+		return false
+	}
+	a.BackupStart, a.BackupEnd, b.BackupStart, b.BackupEnd = time.Time{}, time.Time{}, time.Time{}, time.Time{}
+	return a == b
+}
+
+// TestSummaryInterceptor checks that the summary event of a backup fills the
+// result with the snapshot ID and every figure, and that the events still
+// reach the caller.
+func TestSummaryInterceptor(t *testing.T) {
+	var result BackupResult
+	var forwarded []string
+	intercept := summaryInterceptor(&result, func(ev ProgressEvent) error {
+		forwarded = append(forwarded, ev.MessageType)
+		return nil
+	})
+
+	for _, line := range []string{`{"message_type":"status","percent_done":0.5}`, resticSummaryLine} {
+		var ev ProgressEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		ev.Raw = line
+		if err := intercept(ev); err != nil {
+			t.Fatalf("intercept: %v", err)
+		}
+	}
+
+	if result.SnapshotID != "8725bff10a20eaaba50b64cad3d0048e1a0c8343f186b62467aa27c29e199153" {
+		t.Errorf("SnapshotID = %q", result.SnapshotID)
+	}
+	if !equalSummary(result.Summary, wantResticSummary) {
+		t.Errorf("Summary = %+v, want %+v", result.Summary, wantResticSummary)
+	}
+	if !slices.Equal(forwarded, []string{"status", "summary"}) {
+		t.Errorf("forwarded %v, want both events", forwarded)
+	}
+}
+
+// TestSnapshotInfo_Summary checks that `restic snapshots --json` decodes with
+// the summary stored in each snapshot, and with none for a snapshot made by
+// restic < 0.17.
+func TestSnapshotInfo_Summary(t *testing.T) {
+	listing := `[
+	{"time":"2026-11-17T09:46:07.33213638+01:00","id":"aaa","summary":{"backup_start":"2026-11-17T09:46:07.33213638+01:00","backup_end":"2026-11-17T09:46:08.093417686+01:00","files_new":1,"files_changed":2,"files_unmodified":3,"dirs_new":7,"data_blobs":1,"tree_blobs":8,"data_added":3066,"data_added_packed":2500,"total_files_processed":6,"total_bytes_processed":4096}},
+	{"time":"2023-01-02T03:04:05Z","id":"bbb"}
+]`
+	var snaps []SnapshotInfo
+	if err := json.Unmarshal([]byte(listing), &snaps); err != nil {
+		t.Fatal(err)
+	}
+	if !equalSummary(snaps[0].Summary, wantResticSummary) {
+		t.Errorf("summary = %+v, want %+v", snaps[0].Summary, wantResticSummary)
+	}
+	if snaps[1].Summary != (SnapshotSummary{}) {
+		t.Errorf("summary of an old snapshot = %+v, want zero", snaps[1].Summary)
+	}
+}
+
+func TestSnapshotSummary_AddedBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		s    SnapshotSummary
+		want int64
+	}{
+		{"packed size", SnapshotSummary{DataAdded: 3066, DataAddedPacked: 2500}, 2500},
+		{"no packed size", SnapshotSummary{DataAdded: 3066}, 3066},
+		{"nothing added", SnapshotSummary{}, 0},
+	}
+	for _, tt := range tests {
+		if got := tt.s.AddedBytes(); got != tt.want {
+			t.Errorf("%s: AddedBytes() = %d, want %d", tt.name, got, tt.want)
+		}
 	}
 }
