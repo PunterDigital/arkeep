@@ -676,7 +676,7 @@ func (e *Executor) executeBackup(ctx context.Context, job JobAssignment, sink Lo
 			}
 			if errMsg := e.nonDurableLocalPath(dest.RepoURL, originalURL); errMsg != "" {
 				log("error", fmt.Sprintf("backup to destination %s failed: %s", dest.DestinationID, errMsg))
-				reporter.ReportDestinationResult(job.JobID, dest.DestinationID, "failed", "", destStartedAt, 0, 0, errMsg)
+				reporter.ReportDestinationResult(job.JobID, dest.DestinationID, "failed", "", destStartedAt, nil, 0, errMsg)
 				backupFailed = true
 				continue
 			}
