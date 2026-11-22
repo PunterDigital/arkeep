@@ -21,7 +21,10 @@ Everything we change on top of upstream is listed in `PATCHES.md`.
   (`gh pr merge --merge`), never squash, or the next sync conflicts on everything.
 - Workflows disabled on the fork (`gh workflow disable`, a repo setting, so no file change):
   `release.yml` (upstream's, Docker Hub + arkeep-io), `registry-metadata.yml`, `sponsors.yml`,
-  `deps-pins.yml`. Dependabot version updates stay off: dependency bumps arrive with upstream
+  `deps-pins.yml`, `agent-repository.yml` (v0.12: rebuilds pkg.arkeep.io every Monday from the
+  `release` environment). `packages.yml` (v0.12, tests the `.deb`/`.rpm` build, no secrets) stays
+  on. A new workflow only registers after the sync reaches `main`: disable it right after the
+  merge, before the `-pd` tag. Dependabot version updates stay off: dependency bumps arrive with upstream
   syncs. Re-check after a sync that adds a new workflow.
 
 ## Versions and releases
@@ -32,8 +35,10 @@ Everything we change on top of upstream is listed in `PATCHES.md`.
   so `0.11.0-pd.1` counts as equal to upstream `0.11.0` (no false "update available"). It
   still asks **upstream's** releases, so a new upstream version shows the update badge before
   we've shipped it: that's our cue to sync.
-- `release-pd.yml` (on `v*-pd.*` tags): GoReleaser with `.goreleaser.pd.yml` builds the GUI,
-  server (linux/darwin) and agent (linux incl. armv7/mips, darwin, windows) archives, pushes
+- `release-pd.yml` (on `v*-pd.*` tags): a `gui` job with a read-only token builds the GUI and
+  hands `gui/dist` over as an artifact (ported from upstream's ADR 0021 in v0.12.1-pd.1, so npm
+  code never runs next to the token that pushes images); GoReleaser with `.goreleaser.pd.yml`
+  then builds the server (linux/darwin) and agent (linux incl. armv7/mips, darwin, windows) archives, pushes
   `ghcr.io/punterdigital/arkeep-server` / `-agent` (`:<tag>` and `:latest`), attests
   provenance, then an asset-check job confirms all 13 assets. No Docker Hub, no Helm chart
   (upstream's chart points at upstream images).
