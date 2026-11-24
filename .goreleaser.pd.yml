@@ -214,8 +214,8 @@ release:
 
     ```bash
     sha256sum --check --ignore-missing checksums.txt
-    gh attestation verify arkeep-server_linux_amd64.tar.gz --repo PunterDigital/arkeep
-    gh attestation verify oci://ghcr.io/punterdigital/arkeep-server:{{ .Tag }} --repo PunterDigital/arkeep
+    gh attestation verify arkeep-server_linux_amd64.tar.gz --repo PunterDigital/arkeep --signer-workflow PunterDigital/arkeep/.github/workflows/release-pd.yml --source-ref refs/tags/{{ .Tag }}
+    gh attestation verify oci://ghcr.io/punterdigital/arkeep-server:{{ .Tag }} --repo PunterDigital/arkeep --signer-workflow PunterDigital/arkeep/.github/workflows/release-pd.yml --source-ref refs/tags/{{ .Tag }}
     ```
     {{ if .PreviousTag }}
     **Full Changelog**: https://github.com/PunterDigital/arkeep/compare/{{ .PreviousTag }}...{{ .Tag }}
